@@ -21,15 +21,11 @@ GLOBAL_PERPLEXITY_CAP = 100  # safety net per run
 
 AGENCIES = [
     (302, "Office of the Governor"),
-    (303, "Texas Facilities Commission"),
     (304, "Comptroller of Public Accounts"),
     (313, "Department of Information Resources"),
     (405, "Department of Public Safety"),
-    (529, "Health and Human Services Commission"),
-    (537, "Department of State Health Services"),
     (551, "Department of Agriculture"),
     (582, "Commission on Environmental Quality"),
-    (601, "Department of Transportation"),
     (696, "Department of Criminal Justice"),
     (701, "Texas Education Agency"),
     (720, "University of Texas System"),
