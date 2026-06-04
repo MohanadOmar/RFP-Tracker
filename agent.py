@@ -93,6 +93,7 @@ def run(triggered_by: str = "manual") -> dict:
                     "ai_analysis": format_ai_analysis(rfp),
                     "relevance_score": score,
                     "relevance_reason": rfp.get("relevance_reason", ""),
+                    "category": rfp.get("category", "Other"),
                     "seen_date": today,
                 }
                 base44_client.create_rfp(payload)

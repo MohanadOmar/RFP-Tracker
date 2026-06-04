@@ -47,6 +47,7 @@ def create_rfp(data: dict) -> dict:
         "ai_analysis": data.get("ai_analysis", ""),
         "relevance_score": data.get("relevance_score", 0),
         "relevance_reason": data.get("relevance_reason", ""),
+        "category": data.get("category", "Other"),
         "status": "New",
         "seen_date": data.get("seen_date"),
         "notified": False,
@@ -61,5 +62,14 @@ def create_job_log(data: dict) -> dict:
     """Insert a job log record."""
     url = f"{BASE44_API_URL}/entities/JobLog"
     r = requests.post(url, headers=_headers(), json=data, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def update_rfp(rfp_id: str, updates: dict) -> dict:
+    """Update fields on an existing RFP record. Used by backfill."""
+    url = f"{BASE44_API_URL}/entities/RFP/{rfp_id}"
+    clean = {k: v for k, v in updates.items() if v is not None}
+    r = requests.put(url, headers=_headers(), json=clean, timeout=30)
     r.raise_for_status()
     return r.json()

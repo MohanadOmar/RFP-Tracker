@@ -77,6 +77,44 @@ def status():
     return jsonify(last_run_status)
 
 
+@app.route("/backfill-categories", methods=["POST"])
+def trigger_backfill():
+    """One-shot endpoint to classify existing RFPs that have no category."""
+    if not _check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    limit = body.get("limit")  # optional cap, e.g. {"limit": 20}
+
+    def _run():
+        global last_run_status
+        last_run_status = {"status": "backfilling", "started_at": datetime.utcnow().isoformat()}
+        try:
+            import backfill
+            result = backfill.run_backfill(limit=limit)
+            last_run_status = {
+                "status": "backfill_completed",
+                "result": result,
+                "finished_at": datetime.utcnow().isoformat(),
+            }
+        except Exception as e:
+            last_run_status = {
+                "status": "backfill_failed",
+                "error": str(e),
+                "finished_at": datetime.utcnow().isoformat(),
+            }
+            print(f"[backfill] FAILED: {e}")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    return jsonify({
+        "status": "started",
+        "message": "Backfill started in background. Check /status for progress.",
+        "limit": limit,
+    }), 202
+
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({"service": "EMC RFP Agent", "status": "online"})

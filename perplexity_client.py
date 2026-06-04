@@ -64,11 +64,15 @@ markdown, no preamble. Each item:
   "prebid_date": "YYYY-MM-DD or null",
   "url": "string",
   "requirements": ["string"],
+  "category": "Lobbying | Grants | Government Relations | Web Development | AI | Other",
   "relevance_score": <integer 1-10>,
   "relevance_reason": "string"
 }}
 
 {SCORING_RUBRIC}
+
+CATEGORY: pick the ONE best fit from Lobbying, Grants, Government Relations,
+Web Development, AI, or Other. Default to "Other" only when nothing fits.
 
 Return [] if no RFPs. Always valid JSON.
 """
@@ -91,11 +95,27 @@ isn't in the text, use empty string or null.
   "deadline": "YYYY-MM-DD or null",
   "prebid_date": "YYYY-MM-DD or null",
   "requirements": ["string", "string"],
+  "category": "string (see CATEGORY GUIDE below)",
   "relevance_score": <integer 1-10>,
   "relevance_reason": "string explaining the score"
 }}
 
 {SCORING_RUBRIC}
+
+CATEGORY GUIDE — pick the ONE best fit:
+- "Lobbying" — lobbying services, legislative advocacy, government affairs,
+  legislative representation, political consulting
+- "Grants" — grant writing, grant consulting, grant management, grant programs
+- "Government Relations" — public affairs, intergovernmental relations,
+  policy consulting, strategic government engagement
+- "Web Development" — websites, web apps, portals, digital platforms,
+  web design, web modernization
+- "AI" — AI integration, machine learning, automation, chatbots,
+  data platforms with AI/ML components
+- "Other" — anything else (still return a relevance_score honestly)
+
+If the RFP could fit two categories, pick the one most central to the work
+described. Default to "Other" only when no service category fits.
 
 If the detail page is mostly empty (e.g. just says "see attached PDF"), score
 based on the title and any visible scope text. Note in relevance_reason that
@@ -138,7 +158,7 @@ def fetch_via_jina(url: str, char_limit: int = 6000, timeout: int = 30) -> str:
         r.raise_for_status()
         return r.text[:char_limit]
 
-    r.raise_for_status()
+    r.raise_for_status()  # final fail
     return ""
 
 
@@ -227,5 +247,12 @@ def analyze_single_rfp_detail(
     parsed.setdefault("agency", agency_name)
     parsed.setdefault("relevance_score", 0)
     parsed.setdefault("relevance_reason", "Detail page parse failed")
+    parsed.setdefault("category", "Other")
+
+    # Validate category — fall back to Other if Perplexity returns garbage
+    VALID_CATEGORIES = {"Lobbying", "Grants", "Government Relations",
+                        "Web Development", "AI", "Other"}
+    if parsed.get("category") not in VALID_CATEGORIES:
+        parsed["category"] = "Other"
 
     return parsed
