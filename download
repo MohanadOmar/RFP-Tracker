@@ -1,0 +1,13 @@
+# Base44
+BASE44_API_URL=https://base44.app/api/apps/6a205fdf0bd65bde5b8b84cf
+BASE44_API_KEY=your_base44_key_here
+
+# Perplexity
+PERPLEXITY_API_KEY=pplx-xxxxxxxxxxxxx
+
+# Shared secret for /run endpoint
+RAILWAY_SECRET=emc-railway-2026-momo
+
+# Optional — defaults shown
+JINA_BASE_URL=https://r.jina.ai/
+PORT=8080

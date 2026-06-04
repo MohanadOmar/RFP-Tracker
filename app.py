@@ -1,106 +1,101 @@
-"""Flask service: /run (manual trigger) + /health + daily scheduler."""
-import os
-import threading
-from datetime import datetime
-from flask import Flask, request, jsonify
-from apscheduler.schedulers.background import BackgroundScheduler
-from dotenv import load_dotenv
-
-load_dotenv()
-
-import agent
-
-app = Flask(__name__)
-
-RAILWAY_SECRET = os.environ.get("RAILWAY_SECRET", "")
-SCHEDULER_HOUR_CST = int(os.environ.get("SCHEDULER_HOUR_CST", 9))
-
-last_run_status = {"status": "idle", "result": None}
+"""Orchestrates the full fetch → analyze → save pipeline."""
+import time
+from datetime import datetime, date
+from sources import ALL_SOURCES
+import base44_client
 
 
-def _check_auth() -> bool:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return False
-    return auth.replace("Bearer ", "").strip() == RAILWAY_SECRET
+def format_ai_analysis(rfp: dict) -> str:
+    parts = []
+    if rfp.get("relevance_reason"):
+        parts.append(rfp["relevance_reason"])
+    reqs = rfp.get("requirements") or []
+    if reqs:
+        parts.append("Requirements:\n" + "\n".join(f"• {r}" for r in reqs))
+    if rfp.get("description"):
+        parts.append(f"Description:\n{rfp['description']}")
+    return "\n\n".join(parts)
 
 
-def _run_in_background(triggered_by: str):
-    global last_run_status
-    last_run_status = {"status": "running", "started_at": datetime.utcnow().isoformat()}
+def run(triggered_by: str = "manual") -> dict:
+    t0 = time.time()
+    errors = []
+    sources_checked = 0
+    solicitations_found = 0
+    new_rfps_saved = 0
+
+    print(f"[agent] Starting run — triggered by {triggered_by}")
+    existing_ids = base44_client.existing_solicitation_ids()
+    print(f"[agent] {len(existing_ids)} existing RFPs in database")
+
+    today = date.today().isoformat()
+
+    for source_module in ALL_SOURCES:
+        sources_checked += 1
+        source_name = source_module.SOURCE_NAME
+        print(f"[{source_name}] Fetching...")
+
+        try:
+            rfps = source_module.fetch()
+            print(f"[{source_name}] Got {len(rfps)} RFPs from source")
+        except Exception as e:
+            errors.append(f"[{source_name}] Fetch failed: {e}")
+            print(f"[{source_name}] ERROR: {e}")
+            continue
+
+        solicitations_found += len(rfps)
+
+        for rfp in rfps:
+            sol_id = rfp.get("solicitation_id")
+            if not sol_id or sol_id in existing_ids:
+                continue
+
+            try:
+                payload = {
+                    "solicitation_id": sol_id,
+                    "title": rfp.get("title", "Untitled"),
+                    "agency": rfp.get("agency", ""),
+                    "description": rfp.get("description", ""),
+                    "contact_info": rfp.get("contact_info", ""),
+                    "deadline": rfp.get("deadline"),
+                    "prebid_date": rfp.get("prebid_date"),
+                    "source": rfp.get("source", source_name),
+                    "url": rfp.get("url", ""),
+                    "ai_analysis": format_ai_analysis(rfp),
+                    "relevance_score": rfp.get("relevance_score", 0),
+                    "relevance_reason": rfp.get("relevance_reason", ""),
+                    "seen_date": today,
+                }
+                base44_client.create_rfp(payload)
+                existing_ids.add(sol_id)
+                new_rfps_saved += 1
+                print(f"[{source_name}] Saved: {payload['title'][:50]}")
+            except Exception as e:
+                errors.append(f"[{source_name}/{sol_id}] Save failed: {e}")
+                print(f"[{source_name}] Save error: {e}")
+
+    duration = int(time.time() - t0)
+
     try:
-        result = agent.run(triggered_by=triggered_by)
-        last_run_status = {"status": "completed", "result": result, "finished_at": datetime.utcnow().isoformat()}
+        base44_client.create_job_log({
+            "run_date": datetime.utcnow().isoformat() + "Z",
+            "sources_checked": sources_checked,
+            "solicitations_found": solicitations_found,
+            "new_rfps_saved": new_rfps_saved,
+            "errors": "\n".join(errors) if errors else None,
+            "duration_seconds": duration,
+            "triggered_by": triggered_by,
+        })
     except Exception as e:
-        last_run_status = {"status": "failed", "error": str(e), "finished_at": datetime.utcnow().isoformat()}
-        print(f"[scheduler] Job failed: {e}")
+        print(f"[agent] Failed to write JobLog: {e}")
 
+    print(f"[agent] Done in {duration}s — {new_rfps_saved} new RFPs saved, {len(errors)} errors")
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "ok",
-        "service": "emc-rfp-agent",
-        "last_run": last_run_status,
-    })
-
-
-@app.route("/run", methods=["POST"])
-def trigger_run():
-    if not _check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    body = request.get_json(silent=True) or {}
-    triggered_by = body.get("triggered_by", "manual")
-
-    if last_run_status.get("status") == "running":
-        return jsonify({
-            "status": "already_running",
-            "message": "A job is already in progress",
-            "started_at": last_run_status.get("started_at"),
-        }), 202
-
-    thread = threading.Thread(target=_run_in_background, args=(triggered_by,), daemon=True)
-    thread.start()
-
-    return jsonify({
-        "status": "started",
-        "message": "Agent run started in background",
+    return {
+        "sources_checked": sources_checked,
+        "solicitations_found": solicitations_found,
+        "new_rfps_saved": new_rfps_saved,
+        "duration_seconds": duration,
+        "errors": errors,
         "triggered_by": triggered_by,
-    }), 202
-
-
-@app.route("/status", methods=["GET"])
-def status():
-    if not _check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-    return jsonify(last_run_status)
-
-
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"service": "EMC RFP Agent", "status": "online"})
-
-
-# Daily scheduler — 9 AM CST = 14:00 UTC (15:00 during DST)
-def scheduled_run():
-    print(f"[scheduler] Cron trigger at {datetime.utcnow().isoformat()}Z")
-    _run_in_background("scheduled")
-
-
-scheduler = BackgroundScheduler(timezone="America/Chicago")
-scheduler.add_job(
-    scheduled_run,
-    trigger="cron",
-    hour=SCHEDULER_HOUR_CST,
-    minute=0,
-    id="daily_rfp_fetch",
-    replace_existing=True,
-)
-scheduler.start()
-print(f"[scheduler] Daily run scheduled for {SCHEDULER_HOUR_CST}:00 CST")
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    }
