@@ -1,106 +1,65 @@
-"""Flask service: /run (manual trigger) + /health + daily scheduler."""
+"""Wrapper for Base44 REST API. Handles RFP and JobLog entities."""
 import os
-import threading
-from datetime import datetime
-from flask import Flask, request, jsonify
-from apscheduler.schedulers.background import BackgroundScheduler
-from dotenv import load_dotenv
+import requests
 
-load_dotenv()
-
-import agent
-
-app = Flask(__name__)
-
-RAILWAY_SECRET = os.environ.get("RAILWAY_SECRET", "")
-SCHEDULER_HOUR_CST = int(os.environ.get("SCHEDULER_HOUR_CST", 9))
-
-last_run_status = {"status": "idle", "result": None}
+BASE44_API_URL = os.environ.get("BASE44_API_URL", "").rstrip("/")
+BASE44_API_KEY = os.environ.get("BASE44_API_KEY", "")
 
 
-def _check_auth() -> bool:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return False
-    return auth.replace("Bearer ", "").strip() == RAILWAY_SECRET
+def _headers():
+    return {
+        "api_key": BASE44_API_KEY,
+        "Content-Type": "application/json",
+    }
 
 
-def _run_in_background(triggered_by: str):
-    global last_run_status
-    last_run_status = {"status": "running", "started_at": datetime.utcnow().isoformat()}
+def list_rfps():
+    """Return all RFPs in the database. Used for deduplication."""
+    url = f"{BASE44_API_URL}/entities/RFP"
+    r = requests.get(url, headers=_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def existing_solicitation_ids() -> set[str]:
+    """Set of already-seen solicitation IDs for deduplication."""
     try:
-        result = agent.run(triggered_by=triggered_by)
-        last_run_status = {"status": "completed", "result": result, "finished_at": datetime.utcnow().isoformat()}
+        rfps = list_rfps()
+        return {r["solicitation_id"] for r in rfps if r.get("solicitation_id")}
     except Exception as e:
-        last_run_status = {"status": "failed", "error": str(e), "finished_at": datetime.utcnow().isoformat()}
-        print(f"[scheduler] Job failed: {e}")
+        print(f"[base44] Failed to fetch existing RFPs: {e}")
+        return set()
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "ok",
-        "service": "emc-rfp-agent",
-        "last_run": last_run_status,
-    })
+def create_rfp(data: dict) -> dict:
+    """Insert a new RFP record."""
+    url = f"{BASE44_API_URL}/entities/RFP"
+    payload = {
+        "solicitation_id": data.get("solicitation_id", ""),
+        "title": data.get("title", "Untitled"),
+        "agency": data.get("agency", ""),
+        "description": data.get("description", ""),
+        "contact_info": data.get("contact_info", ""),
+        "deadline": data.get("deadline") or None,
+        "prebid_date": data.get("prebid_date") or None,
+        "source": data.get("source", ""),
+        "url": data.get("url", ""),
+        "ai_analysis": data.get("ai_analysis", ""),
+        "relevance_score": data.get("relevance_score", 0),
+        "relevance_reason": data.get("relevance_reason", ""),
+        "status": "New",
+        "seen_date": data.get("seen_date"),
+        "notified": False,
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    r = requests.post(url, headers=_headers(), json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
-@app.route("/run", methods=["POST"])
-def trigger_run():
-    if not _check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    body = request.get_json(silent=True) or {}
-    triggered_by = body.get("triggered_by", "manual")
-
-    if last_run_status.get("status") == "running":
-        return jsonify({
-            "status": "already_running",
-            "message": "A job is already in progress",
-            "started_at": last_run_status.get("started_at"),
-        }), 202
-
-    thread = threading.Thread(target=_run_in_background, args=(triggered_by,), daemon=True)
-    thread.start()
-
-    return jsonify({
-        "status": "started",
-        "message": "Agent run started in background",
-        "triggered_by": triggered_by,
-    }), 202
-
-
-@app.route("/status", methods=["GET"])
-def status():
-    if not _check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-    return jsonify(last_run_status)
-
-
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"service": "EMC RFP Agent", "status": "online"})
-
-
-# Daily scheduler — 9 AM CST = 14:00 UTC (15:00 during DST)
-def scheduled_run():
-    print(f"[scheduler] Cron trigger at {datetime.utcnow().isoformat()}Z")
-    _run_in_background("scheduled")
-
-
-scheduler = BackgroundScheduler(timezone="America/Chicago")
-scheduler.add_job(
-    scheduled_run,
-    trigger="cron",
-    hour=SCHEDULER_HOUR_CST,
-    minute=0,
-    id="daily_rfp_fetch",
-    replace_existing=True,
-)
-scheduler.start()
-print(f"[scheduler] Daily run scheduled for {SCHEDULER_HOUR_CST}:00 CST")
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+def create_job_log(data: dict) -> dict:
+    """Insert a job log record."""
+    url = f"{BASE44_API_URL}/entities/JobLog"
+    r = requests.post(url, headers=_headers(), json=data, timeout=30)
+    r.raise_for_status()
+    return r.json()
