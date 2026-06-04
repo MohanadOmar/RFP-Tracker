@@ -38,12 +38,18 @@ def run(triggered_by: str = "manual") -> dict:
     sources_checked = 0
     solicitations_found = 0
     new_rfps_saved = 0
+    skipped_low_score = 0
 
     print(f"[agent] Starting run — triggered by {triggered_by}")
     existing_ids = base44_client.existing_solicitation_ids()
-    print(f"[agent] {len(existing_ids)} existing RFPs in database")
+    # Snapshot of IDs that existed BEFORE this run — used as the dedup gate.
+    # We DON'T add to this set during the run, so RFPs scored by a source
+    # in this run aren't mistakenly treated as duplicates here.
+    pre_run_ids = set(existing_ids)
+    print(f"[agent] {len(pre_run_ids)} existing RFPs in database")
 
     today = date.today().isoformat()
+    MIN_SCORE_TO_SAVE = 3   # drop noise; raise/lower as needed
 
     for source_module in ALL_SOURCES:
         sources_checked += 1
@@ -62,9 +68,15 @@ def run(triggered_by: str = "manual") -> dict:
 
         for rfp in rfps:
             sol_id = rfp.get("solicitation_id")
-            if not sol_id or sol_id in existing_ids:
-                # existing_ids is updated in-place by txsmartbuy.fetch(),
-                # so this still works as a final safety net
+            if not sol_id:
+                continue
+            if sol_id in pre_run_ids:
+                # Was already in the DB before this run started — safety net
+                continue
+
+            score = rfp.get("relevance_score", 0) or 0
+            if score < MIN_SCORE_TO_SAVE:
+                skipped_low_score += 1
                 continue
 
             try:
@@ -79,14 +91,14 @@ def run(triggered_by: str = "manual") -> dict:
                     "source": rfp.get("source", source_name),
                     "url": rfp.get("url", ""),
                     "ai_analysis": format_ai_analysis(rfp),
-                    "relevance_score": rfp.get("relevance_score", 0),
+                    "relevance_score": score,
                     "relevance_reason": rfp.get("relevance_reason", ""),
                     "seen_date": today,
                 }
                 base44_client.create_rfp(payload)
-                existing_ids.add(sol_id)
+                pre_run_ids.add(sol_id)  # avoid duplicate saves within this run
                 new_rfps_saved += 1
-                print(f"[{source_name}] Saved: {payload['title'][:50]}")
+                print(f"[{source_name}] Saved (score {score}): {payload['title'][:50]}")
             except Exception as e:
                 errors.append(f"[{source_name}/{sol_id}] Save failed: {e}")
                 print(f"[{source_name}] Save error: {e}")
@@ -106,12 +118,15 @@ def run(triggered_by: str = "manual") -> dict:
     except Exception as e:
         print(f"[agent] Failed to write JobLog: {e}")
 
-    print(f"[agent] Done in {duration}s — {new_rfps_saved} new RFPs saved, {len(errors)} errors")
+    print(f"[agent] Done in {duration}s — {new_rfps_saved} new RFPs saved, "
+          f"{skipped_low_score} dropped (score < {MIN_SCORE_TO_SAVE}), "
+          f"{len(errors)} errors")
 
     return {
         "sources_checked": sources_checked,
         "solicitations_found": solicitations_found,
         "new_rfps_saved": new_rfps_saved,
+        "skipped_low_score": skipped_low_score,
         "duration_seconds": duration,
         "errors": errors,
         "triggered_by": triggered_by,
