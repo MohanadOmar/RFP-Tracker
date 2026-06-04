@@ -107,12 +107,39 @@ Return valid JSON only. No markdown.
 
 # ---- Fetching ----
 
-def fetch_via_jina(url: str, char_limit: int = 6000, timeout: int = 20) -> str:
-    """Fetch a URL through Jina Reader for clean text extraction."""
+def fetch_via_jina(url: str, char_limit: int = 6000, timeout: int = 30) -> str:
+    """Fetch a URL through Jina Reader for clean text extraction.
+
+    Uses JINA_API_KEY if set (higher rate limits + larger free quota).
+    Throttles between calls to respect Jina's rate limits.
+    Retries once on 429 with extra backoff.
+    """
+    global _last_jina_call
+
+    # Throttle: ensure minimum gap between calls
+    now = time.time()
+    elapsed = now - _last_jina_call
+    if elapsed < JINA_THROTTLE_SECONDS:
+        time.sleep(JINA_THROTTLE_SECONDS - elapsed)
+
     jina_url = f"{JINA_BASE}/{quote(url, safe='')}"
-    r = requests.get(jina_url, headers={"Accept": "text/plain"}, timeout=timeout)
+    headers = {"Accept": "text/plain"}
+    if JINA_API_KEY:
+        headers["Authorization"] = f"Bearer {JINA_API_KEY}"
+
+    for attempt in range(2):
+        _last_jina_call = time.time()
+        r = requests.get(jina_url, headers=headers, timeout=timeout)
+        if r.status_code == 429 and attempt == 0:
+            # Got rate-limited despite throttling — back off harder and retry once
+            print(f"  Jina 429, backing off 10s before retry...")
+            time.sleep(10)
+            continue
+        r.raise_for_status()
+        return r.text[:char_limit]
+
     r.raise_for_status()
-    return r.text[:char_limit]
+    return ""
 
 
 def _call_perplexity(system_prompt: str, user_content: str, timeout: int = 45) -> str:
