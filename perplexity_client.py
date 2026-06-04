@@ -1,4 +1,9 @@
-"""Perplexity client — used by all sources for RFP extraction + scoring."""
+"""Perplexity client — Jina fetch + RFP analysis helpers.
+
+Two analysis functions:
+- analyze_with_perplexity: legacy, extracts MANY RFPs from a listing page
+- analyze_single_rfp_detail: NEW, scores a single RFP from its detail page
+"""
 import os
 import json
 import re
@@ -8,48 +13,93 @@ from urllib.parse import quote
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
 JINA_BASE = os.environ.get("JINA_BASE_URL", "https://r.jina.ai/").rstrip("/")
 
-SYSTEM_PROMPT = """You are an RFP analyst for EMC Strategy Group, a Texas-based firm.
+# ---- Shared prompt fragments ----
 
-EMC's services:
+EMC_SERVICES_BLOCK = """
+EMC Strategy Group's services:
 - Lobbying and legislative advocacy
 - Grant writing and grant consulting
 - Government relations and public affairs
 - Web development and website design
 - AI integrations and machine learning consulting
+"""
 
-Extract every RFP/solicitation from the provided text. Return a JSON ARRAY only —
-no markdown, no preamble. Each item must have these exact keys:
-
-{
-  "solicitation_id": "string (the unique ID/number)",
-  "title": "string",
-  "description": "string (1-3 sentence summary)",
-  "agency": "string (issuing organization)",
-  "contact_info": "string (email/phone if found, else empty)",
-  "deadline": "YYYY-MM-DD or null",
-  "prebid_date": "YYYY-MM-DD or null",
-  "url": "string (direct link if found, else empty)",
-  "requirements": ["string", "string"],
-  "relevance_score": <integer 1-10>,
-  "relevance_reason": "string explaining the score"
-}
-
+SCORING_RUBRIC = """
 SCORING GUIDE (be discriminating, not generous):
-- 9-10: Direct match — RFP explicitly asks for lobbying, government relations,
+- 9-10: Direct match — explicitly asks for lobbying, government relations,
   legislative advocacy, grants consulting, web development, or AI services.
 - 7-8: Strong match — strategic consulting, policy advisory, digital
   transformation, public affairs, advocacy-adjacent.
 - 4-6: Tangential — communications, marketing, general consulting,
-  research services. Could be a fit for EMC's broader capability.
+  research services. Could fit EMC's broader capability.
 - 1-3: Unrelated — construction, supplies, equipment, food service,
   janitorial, fleet maintenance, athletic equipment, vehicles, etc.
 
-Do NOT default to 5. Most government RFPs are unrelated (1-3). Reserve high
-scores (7+) for genuine service-line matches.
-
-Return [] if no RFPs in the text. Always valid JSON.
+Do NOT default to 5. Most government RFPs are unrelated (1-3). Reserve
+high scores (7+) for genuine service-line matches.
 """
 
+# ---- Listing extraction (still used by samgov/bidnet/civcast) ----
+
+LIST_SYSTEM_PROMPT = f"""You are an RFP analyst for EMC Strategy Group.
+
+{EMC_SERVICES_BLOCK}
+
+Extract every RFP from the provided text. Return a JSON ARRAY only — no
+markdown, no preamble. Each item:
+
+{{
+  "solicitation_id": "string",
+  "title": "string",
+  "description": "string (1-3 sentences)",
+  "agency": "string",
+  "contact_info": "string",
+  "deadline": "YYYY-MM-DD or null",
+  "prebid_date": "YYYY-MM-DD or null",
+  "url": "string",
+  "requirements": ["string"],
+  "relevance_score": <integer 1-10>,
+  "relevance_reason": "string"
+}}
+
+{SCORING_RUBRIC}
+
+Return [] if no RFPs. Always valid JSON.
+"""
+
+# ---- Detail-page scoring (new, used by txsmartbuy) ----
+
+DETAIL_SYSTEM_PROMPT = f"""You are an RFP analyst for EMC Strategy Group.
+
+{EMC_SERVICES_BLOCK}
+
+You will be given the DETAIL PAGE of a single RFP. Read carefully and return
+ONE JSON OBJECT (not an array). Extract everything you can find. If a field
+isn't in the text, use empty string or null.
+
+{{
+  "title": "string (the RFP title or subject)",
+  "description": "string (2-4 sentence summary of what the RFP is for)",
+  "agency": "string (issuing agency or organization)",
+  "contact_info": "string (name + email/phone if present)",
+  "deadline": "YYYY-MM-DD or null",
+  "prebid_date": "YYYY-MM-DD or null",
+  "requirements": ["string", "string"],
+  "relevance_score": <integer 1-10>,
+  "relevance_reason": "string explaining the score"
+}}
+
+{SCORING_RUBRIC}
+
+If the detail page is mostly empty (e.g. just says "see attached PDF"), score
+based on the title and any visible scope text. Note in relevance_reason that
+the detail page was sparse.
+
+Return valid JSON only. No markdown.
+"""
+
+
+# ---- Fetching ----
 
 def fetch_via_jina(url: str, char_limit: int = 6000, timeout: int = 20) -> str:
     """Fetch a URL through Jina Reader for clean text extraction."""
@@ -59,44 +109,90 @@ def fetch_via_jina(url: str, char_limit: int = 6000, timeout: int = 20) -> str:
     return r.text[:char_limit]
 
 
-def analyze_with_perplexity(text: str, context: str = "") -> list[dict]:
-    """Send raw text to Perplexity, get a list of structured RFPs back."""
+def _call_perplexity(system_prompt: str, user_content: str, timeout: int = 45) -> str:
     if not PERPLEXITY_API_KEY:
         raise RuntimeError("PERPLEXITY_API_KEY not set")
 
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "sonar",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{context}\n\n{text}"},
-        ],
-        "temperature": 0.1,
-    }
-
     r = requests.post(
         "https://api.perplexity.ai/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=45,
+        headers={
+            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "sonar",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": 0.1,
+        },
+        timeout=timeout,
     )
     r.raise_for_status()
-    raw = r.json()["choices"][0]["message"]["content"]
+    return r.json()["choices"][0]["message"]["content"]
 
-    cleaned = re.sub(r"```json\s*|```\s*", "", raw).strip()
+
+def _strip_json_fences(raw: str) -> str:
+    return re.sub(r"```json\s*|```\s*", "", raw).strip()
+
+
+# ---- Public analysis functions ----
+
+def analyze_with_perplexity(text: str, context: str = "") -> list[dict]:
+    """Extract MANY RFPs from a listing page (used by samgov/bidnet/civcast)."""
+    raw = _call_perplexity(LIST_SYSTEM_PROMPT, f"{context}\n\n{text}")
+    cleaned = _strip_json_fences(raw)
 
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\[.*\]", cleaned, re.DOTALL)
-        if not match:
+        m = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if not m:
             return []
         try:
-            parsed = json.loads(match.group())
+            parsed = json.loads(m.group())
         except json.JSONDecodeError:
             return []
 
     return parsed if isinstance(parsed, list) else [parsed]
+
+
+def analyze_single_rfp_detail(
+    detail_text: str,
+    sid: str,
+    agency_name: str,
+    agency_number: int,
+) -> dict:
+    """Score a single RFP from its detail page. Returns one dict."""
+    user_content = (
+        f"Solicitation ID: {sid}\n"
+        f"Issuing Agency: {agency_name} (Texas SmartBuy member {agency_number})\n"
+        f"Source: Texas SmartBuy ESBD detail page\n\n"
+        f"--- DETAIL PAGE CONTENT ---\n{detail_text}"
+    )
+    raw = _call_perplexity(DETAIL_SYSTEM_PROMPT, user_content)
+    cleaned = _strip_json_fences(raw)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+            except json.JSONDecodeError:
+                parsed = {}
+        else:
+            parsed = {}
+
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    # Always provide minimum fields so caller doesn't crash
+    parsed.setdefault("title", f"Solicitation {sid}")
+    parsed.setdefault("agency", agency_name)
+    parsed.setdefault("relevance_score", 0)
+    parsed.setdefault("relevance_reason", "Detail page parse failed")
+
+    return parsed
