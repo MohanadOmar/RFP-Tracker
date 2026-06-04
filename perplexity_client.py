@@ -7,11 +7,17 @@ Two analysis functions:
 import os
 import json
 import re
+import time
 import requests
 from urllib.parse import quote
 
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
 JINA_BASE = os.environ.get("JINA_BASE_URL", "https://r.jina.ai/").rstrip("/")
+JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
+
+# Throttle between Jina calls (seconds). Lower if you have an API key.
+JINA_THROTTLE_SECONDS = float(os.environ.get("JINA_THROTTLE_SECONDS", "0.3" if JINA_API_KEY else "2.5"))
+_last_jina_call = 0.0
 
 # ---- Shared prompt fragments ----
 
