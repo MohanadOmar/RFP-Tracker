@@ -1,23 +1,26 @@
-"""TX SmartBuy / ESBD — agency-by-agency fetch with smart dedup.
+"""TX SmartBuy / ESBD — V2 pipeline.
 
-Pipeline:
-1. Fetch listing page via Jina (cheap)
-2. Regex-extract IDs + metadata from listing (FREE — no Perplexity)
-3. Filter out RFPs already in Base44 DB (FREE)
-4. Filter out RFPs with due date > 90 days out (FREE)
-5. For each NEW RFP: fetch detail page + Perplexity score (expensive, but only on new ones)
+For each agency:
+  1. Fetch listing page via Jina, regex-extract IDs (no Perplexity)
+  2. Filter out already-seen IDs + out-of-window IDs (FREE)
+  3. For each NEW RFP:
+       a. Fetch detail page HTML via requests + BS4 (structured metadata)
+       b. Find first PDF, extract text via Jina
+       c. Fall back to HTML description if PDF unavailable
+       d. Score the PDF/description text via Perplexity
 
 Safety cap: max 100 Perplexity calls per run.
 """
 import re
 from datetime import datetime, timedelta
 from perplexity_client import fetch_via_jina, analyze_single_rfp_detail
+from detail_extractor import extract_content_for_scoring
 
 SOURCE_NAME = "TX SmartBuy"
 BASE_URL = "https://www.txsmartbuy.gov/esbd"
 MAX_PAGES_PER_AGENCY = 3
 MAX_DAYS_OUT = 90
-GLOBAL_PERPLEXITY_CAP = 100  # safety net per run
+GLOBAL_PERPLEXITY_CAP = 100
 
 AGENCIES = [
     (302, "Office of the Governor"),
@@ -33,8 +36,6 @@ AGENCIES = [
 ]
 
 NO_RESULTS_MARKER = "No results found"
-
-# Module-level counter resets each fetch() call
 _perplexity_calls_this_run = 0
 
 
@@ -47,26 +48,12 @@ def _build_listing_url(agency_number: int, page: int) -> str:
     )
 
 
-def _build_detail_url(solicitation_id: str) -> str:
-    return f"{BASE_URL}/{solicitation_id}"
-
-
 def _parse_listing(text: str) -> list[dict]:
-    """Extract solicitation records from listing page text via regex.
-
-    Each record in the listing looks like:
-      **Solicitation ID:** 405-26R0018465
-      **Due Date:** 6/10/2026
-      **Due Time:** 5:00 PM
-      **Agency/Texas SmartBuy Member Number:** 405
-      **Status:** Posted
-      **Posting Date:** 5/14/2026
-    """
+    """Extract solicitation records from listing page via regex."""
     records = []
-    # Split into blocks by Solicitation ID marker
     blocks = re.split(r"\*\*Solicitation ID:\*\*", text)
 
-    for block in blocks[1:]:  # skip header before first ID
+    for block in blocks[1:]:
         sol_id_match = re.match(r"\s*([\w\-]+)", block)
         if not sol_id_match:
             continue
@@ -87,7 +74,6 @@ def _parse_listing(text: str) -> list[dict]:
 
 
 def _parse_us_date(s: str) -> datetime | None:
-    """Parse M/D/YYYY to datetime, or None if invalid."""
     if not s:
         return None
     try:
@@ -96,28 +82,17 @@ def _parse_us_date(s: str) -> datetime | None:
         return None
 
 
-def _to_iso_date(s: str) -> str | None:
-    """Convert M/D/YYYY → YYYY-MM-DD for Base44 date field."""
-    d = _parse_us_date(s)
-    return d.strftime("%Y-%m-%d") if d else None
-
-
 def _is_within_window(due_date_raw: str | None) -> bool:
-    """True if due date is in the future and within MAX_DAYS_OUT days."""
     d = _parse_us_date(due_date_raw)
     if not d:
-        return True  # if we can't parse, keep it rather than drop it
+        return True
     today = datetime.today()
     cutoff = today + timedelta(days=MAX_DAYS_OUT)
     return today <= d <= cutoff
 
 
 def fetch(existing_ids: set[str] | None = None) -> list[dict]:
-    """Fetch new RFPs across all priority agencies.
-
-    existing_ids: set of solicitation_ids already in Base44, used to skip
-    re-fetching and re-scoring known RFPs.
-    """
+    """V2 pipeline: listing → dedup → PDF/HTML extraction → Perplexity scoring."""
     global _perplexity_calls_this_run
     _perplexity_calls_this_run = 0
     existing_ids = existing_ids or set()
@@ -125,7 +100,7 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
 
     for agency_number, agency_name in AGENCIES:
         if _perplexity_calls_this_run >= GLOBAL_PERPLEXITY_CAP:
-            print(f"[{SOURCE_NAME}] Reached global cap of {GLOBAL_PERPLEXITY_CAP} Perplexity calls. Stopping.")
+            print(f"[{SOURCE_NAME}] Reached global cap. Stopping.")
             break
 
         print(f"[{SOURCE_NAME}] Agency {agency_number} — {agency_name}")
@@ -143,7 +118,6 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
                 print(f"  Page {page}: no results, next agency")
                 break
 
-            # Stage 1: regex parse (free)
             listings = _parse_listing(text)
             print(f"  Page {page}: parsed {len(listings)} listings")
 
@@ -166,24 +140,33 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
 
             print(f"    {len(candidates)} new (skipped {skipped_dup} dup, {skipped_date} out-of-window)")
 
-            # Stage 3: deep-fetch + score each NEW candidate
+            # Stage 3: for each NEW candidate — detail + PDF + score
             for L in candidates:
                 if _perplexity_calls_this_run >= GLOBAL_PERPLEXITY_CAP:
                     print(f"  Reached global cap mid-page. Stopping.")
                     break
 
                 sid = L["solicitation_id"]
-                detail_url = _build_detail_url(sid)
 
+                # Get full detail (HTML metadata + PDF text or HTML fallback)
                 try:
-                    detail_text = fetch_via_jina(detail_url, char_limit=6000, timeout=20)
+                    content = extract_content_for_scoring(sid)
                 except Exception as e:
-                    print(f"    {sid} detail fetch error: {e}")
+                    print(f"    {sid} extraction error: {e}")
                     continue
 
+                detail = content["detail"]
+                scoring_text = content["scoring_text"]
+                source_type = content["scoring_source"]
+
+                if not scoring_text or len(scoring_text.strip()) < 50:
+                    print(f"    {sid} skipped — no content to score")
+                    continue
+
+                # Score with Perplexity
                 try:
                     scored = analyze_single_rfp_detail(
-                        detail_text,
+                        scoring_text,
                         sid=sid,
                         agency_name=agency_name,
                         agency_number=agency_number,
@@ -193,21 +176,32 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
                     print(f"    {sid} Perplexity error: {e}")
                     continue
 
-                # Enrich with metadata from listing
+                # Merge HTML metadata into scored result.
+                # HTML wins for structured fields; Perplexity wins for analysis.
                 scored["solicitation_id"] = sid
                 scored["source"] = SOURCE_NAME
-                scored["url"] = detail_url
+                scored["url"] = detail.get("detail_url", f"{BASE_URL}/{sid}")
                 scored["agency_number"] = agency_number
+
+                # Prefer HTML-parsed values when present
+                if detail.get("title"):
+                    scored["title"] = detail["title"]
+                if detail.get("contact_info"):
+                    scored["contact_info"] = detail["contact_info"]
+                if detail.get("deadline"):
+                    scored["deadline"] = detail["deadline"]
                 if not scored.get("agency"):
                     scored["agency"] = agency_name
-                if not scored.get("deadline") and L.get("due_date_raw"):
-                    scored["deadline"] = _to_iso_date(L["due_date_raw"])
 
-                # Mark in-memory so dedup works within this run too
+                # Add scoring provenance
+                scored["scoring_source"] = source_type  # "pdf" | "html" | "none"
+                scored["pdf_url"] = content.get("pdf_used")
+
                 existing_ids.add(sid)
-
                 all_new_rfps.append(scored)
-                print(f"    Scored {sid}: {scored.get('relevance_score', '?')}/10 — {scored.get('title', '')[:50]}")
+
+                indicator = "📄" if source_type == "pdf" else "📝"
+                print(f"    {indicator} Scored {sid}: {scored.get('relevance_score', '?')}/10 — {scored.get('title', '')[:50]}")
 
     print(f"[{SOURCE_NAME}] Done. {len(all_new_rfps)} new RFPs, {_perplexity_calls_this_run} Perplexity calls")
     return all_new_rfps
