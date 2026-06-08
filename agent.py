@@ -96,6 +96,7 @@ def run(triggered_by: str = "manual") -> dict:
                     "category": rfp.get("category", "Other"),
                     "scoring_source": rfp.get("scoring_source", "html"),
                     "pdf_url": rfp.get("pdf_url"),
+                    "nigp_matches": rfp.get("nigp_matches", ""),
                     "seen_date": today,
                 }
                 base44_client.create_rfp(payload)

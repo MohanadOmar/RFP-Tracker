@@ -50,6 +50,7 @@ def create_rfp(data: dict) -> dict:
         "category": data.get("category", "Other"),
         "scoring_source": data.get("scoring_source", "html"),
         "pdf_url": data.get("pdf_url"),
+        "nigp_matches": data.get("nigp_matches", ""),
         "status": "New",
         "seen_date": data.get("seen_date"),
         "notified": False,

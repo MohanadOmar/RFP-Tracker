@@ -258,14 +258,33 @@ def analyze_single_rfp_detail(
     sid: str,
     agency_name: str,
     agency_number: int,
+    nigp_context: str = "",
+    suggested_category: str = "",
 ) -> dict:
-    """Score a single RFP from its detail page. Returns one dict."""
-    user_content = (
-        f"Solicitation ID: {sid}\n"
-        f"Issuing Agency: {agency_name} (Texas SmartBuy member {agency_number})\n"
-        f"Source: Texas SmartBuy ESBD detail page\n\n"
-        f"--- DETAIL PAGE CONTENT ---\n{detail_text}"
-    )
+    """Score a single RFP from its detail page. Returns one dict.
+
+    nigp_context: optional pre-formatted block describing matched NIGP codes
+    suggested_category: NIGP-derived default category (Perplexity may override)
+    """
+    user_parts = [
+        f"Solicitation ID: {sid}",
+        f"Issuing Agency: {agency_name}",
+        "Source: Texas SmartBuy ESBD detail page",
+    ]
+    if nigp_context:
+        user_parts.append("")
+        user_parts.append(nigp_context)
+    if suggested_category:
+        user_parts.append("")
+        user_parts.append(
+            f"Suggested category based on NIGP codes: {suggested_category}. "
+            f"Keep this unless the PDF content clearly indicates a different category."
+        )
+    user_parts.append("")
+    user_parts.append("--- DETAIL PAGE / PDF CONTENT ---")
+    user_parts.append(detail_text)
+    user_content = "\n".join(user_parts)
+
     raw = _call_perplexity(DETAIL_SYSTEM_PROMPT, user_content)
     cleaned = _strip_json_fences(raw)
 
@@ -284,17 +303,16 @@ def analyze_single_rfp_detail(
     if not isinstance(parsed, dict):
         parsed = {}
 
-    # Always provide minimum fields so caller doesn't crash
     parsed.setdefault("title", f"Solicitation {sid}")
     parsed.setdefault("agency", agency_name)
     parsed.setdefault("relevance_score", 0)
     parsed.setdefault("relevance_reason", "Detail page parse failed")
-    parsed.setdefault("category", "Other")
+    # Fall back to NIGP-suggested category if Perplexity didn't return one
+    parsed.setdefault("category", suggested_category or "Other")
 
-    # Validate category — fall back to Other if Perplexity returns garbage
     VALID_CATEGORIES = {"Lobbying", "Grants", "Government Relations",
                         "Web Development", "AI", "Other"}
     if parsed.get("category") not in VALID_CATEGORIES:
-        parsed["category"] = "Other"
+        parsed["category"] = suggested_category if suggested_category in VALID_CATEGORIES else "Other"
 
     return parsed
