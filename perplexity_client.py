@@ -22,12 +22,50 @@ _last_jina_call = 0.0
 # ---- Shared prompt fragments ----
 
 EMC_SERVICES_BLOCK = """
-EMC Strategy Group's services:
+EMC Strategy Group's services (EMC is a SERVICES firm, not a software vendor):
 - Lobbying and legislative advocacy
 - Grant writing and grant consulting
 - Government relations and public affairs
-- Web development and website design
-- AI integrations and machine learning consulting
+- Web development and website design (custom builds for clients)
+- AI integrations and machine learning consulting (custom advisory + integration)
+"""
+
+CRITICAL_DISTINCTION = """
+CRITICAL DISTINCTION — PRODUCT vs SERVICE:
+
+EMC SELLS SERVICES. EMC does NOT sell commercial software products.
+
+Many government RFPs/RFIs sound technology-related but are actually asking
+to PURCHASE a commercial off-the-shelf (COTS) software product. These are
+NOT a fit for EMC, even if the software's purpose involves data, AI,
+documentation, or web technology.
+
+Examples of LOW-scoring RFPs (1-3) even if they mention technology:
+- "We need a SaaS platform for X" — they want to buy software
+- "Investment data platform solution" — they want to buy a data platform product
+- "GRC tool with CMDB integration" — they want to buy a GRC product
+- "Ticketing system" / "ERP system" / "HR platform" — they want to buy software
+- "Software maintenance for [existing product]" — they want product support
+- "Records management system" — they want to buy an RMS product
+- RFIs from agencies doing "market research" on available platforms/products
+
+Examples of HIGHER-scoring RFPs (6-10):
+- "Lobbying services" / "legislative advocacy" — direct service match
+- "Grant writing consulting" — direct service match
+- "Government relations services" — direct service match
+- "Custom web development services" (we build a website for them)
+- "AI strategy consulting" / "AI implementation services" (we advise + integrate)
+- "Public affairs consulting" / "policy advisory"
+
+Heuristic: If the RFP names specific commercial software categories or
+asks "what product can we buy", score LOW. If the RFP asks for a vendor
+to PROVIDE A SERVICE (consulting, advocacy, custom development,
+implementation), score based on service alignment.
+
+When in doubt, ask: "Would EMC be competing against software vendors
+(Snowflake, ServiceNow, etc.) or against consulting firms (Deloitte,
+McKinsey, lobbying firms)?" If the former → score LOW. If the latter →
+score based on category fit.
 """
 
 SCORING_RUBRIC = """
@@ -50,6 +88,8 @@ high scores (7+) for genuine service-line matches.
 LIST_SYSTEM_PROMPT = f"""You are an RFP analyst for EMC Strategy Group.
 
 {EMC_SERVICES_BLOCK}
+
+{CRITICAL_DISTINCTION}
 
 Extract every RFP from the provided text. Return a JSON ARRAY only — no
 markdown, no preamble. Each item:
@@ -82,6 +122,8 @@ Return [] if no RFPs. Always valid JSON.
 DETAIL_SYSTEM_PROMPT = f"""You are an RFP analyst for EMC Strategy Group.
 
 {EMC_SERVICES_BLOCK}
+
+{CRITICAL_DISTINCTION}
 
 You will be given the DETAIL PAGE of a single RFP. Read carefully and return
 ONE JSON OBJECT (not an array). Extract everything you can find. If a field
