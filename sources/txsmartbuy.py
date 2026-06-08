@@ -23,13 +23,13 @@ MAX_DAYS_OUT = 90
 GLOBAL_PERPLEXITY_CAP = 100
 
 AGENCIES = [
-    # (302, "Office of the Governor"),
-    # (304, "Comptroller of Public Accounts"),
-    # (313, "Department of Information Resources"),
-    # (405, "Department of Public Safety"),
-    # (551, "Department of Agriculture"),
-    # (582, "Commission on Environmental Quality"),
-    # (696, "Department of Criminal Justice"),
+    (302, "Office of the Governor"),
+    (304, "Comptroller of Public Accounts"),
+    (313, "Department of Information Resources"),
+    (405, "Department of Public Safety"),
+    (551, "Department of Agriculture"),
+    (582, "Commission on Environmental Quality"),
+    (696, "Department of Criminal Justice"),
     (701, "Texas Education Agency"),
     (720, "University of Texas System"),
     (781, "Higher Education Coordinating Board"),
