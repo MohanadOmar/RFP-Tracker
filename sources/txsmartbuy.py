@@ -1,13 +1,19 @@
-"""TX SmartBuy / ESBD — V2 pipeline.
+"""TX SmartBuy / ESBD — V3 pipeline: NIGP code-driven search.
 
-For each agency:
-  1. Fetch listing page via Jina, regex-extract IDs (no Perplexity)
-  2. Filter out already-seen IDs + out-of-window IDs (FREE)
-  3. For each NEW RFP:
-       a. Fetch detail page HTML via requests + BS4 (structured metadata)
-       b. Find first PDF, extract text via Jina
-       c. Fall back to HTML description if PDF unavailable
-       d. Score the PDF/description text via Perplexity
+Instead of looping through agencies, we loop through EMC-relevant NIGP codes.
+This pulls RFPs from EVERY Texas entity using NIGP (state agencies, cities,
+school districts, libraries, river authorities, universities, etc.) that
+posted work in EMC's service categories.
+
+Pipeline per NIGP code:
+  1. Fetch listing via Jina: txsmartbuy.gov/esbd?nigp={code}&page={n}
+  2. Regex-extract IDs + due dates + status (no Perplexity)
+  3. Filter: dedup, due-date window, drop Closed statuses
+  4. For each NEW RFP:
+       a. BS4 detail page extraction (HTML + PDF URL)
+       b. Jina PDF text extraction (first 8000 chars)
+       c. Pass content + NIGP-suggested category to Perplexity
+       d. Perplexity scores + may override the suggested category
 
 Safety cap: max 100 Perplexity calls per run.
 """
@@ -18,37 +24,47 @@ from detail_extractor import extract_content_for_scoring
 
 SOURCE_NAME = "TX SmartBuy"
 BASE_URL = "https://www.txsmartbuy.gov/esbd"
-MAX_PAGES_PER_AGENCY = 3
+MAX_PAGES_PER_CODE = 5
 MAX_DAYS_OUT = 90
 GLOBAL_PERPLEXITY_CAP = 100
+NO_RESULTS_MARKER = "No results found"
 
-AGENCIES = [
-    (302, "Office of the Governor"),
-    (304, "Comptroller of Public Accounts"),
-    (313, "Department of Information Resources"),
-    (405, "Department of Public Safety"),
-    (551, "Department of Agriculture"),
-    (582, "Commission on Environmental Quality"),
-    (696, "Department of Criminal Justice"),
-    (701, "Texas Education Agency"),
-    (720, "University of Texas System"),
-    (781, "Higher Education Coordinating Board"),
+# EMC-relevant NIGP codes with their default category assignment.
+# Categories: Lobbying, Grants, Government Relations, Web Development, AI, Other
+NIGP_CODES = [
+    # (code, description, default_category)
+
+    # --- Government Relations / Lobbying ---
+    ("91858", "Governmental Consulting", "Government Relations"),
+    ("91826", "Communications: Public Relations Consulting", "Government Relations"),
+    ("91827", "Community Development Consulting", "Government Relations"),
+    ("96153", "Marketing Service, Public Opinion Surveys, Research", "Government Relations"),
+    ("91871", "Management Consulting", "Government Relations"),
+
+    # --- Grants ---
+    ("91846", "Feasibility Studies (Consulting)", "Grants"),
+    ("94649", "Financial Services", "Grants"),
+    ("95877", "Project Management Services", "Grants"),
+
+    # --- Web Development ---
+    ("91596", "Web Page Design, Management and Maintenance Services", "Web Development"),
+    ("20872", "Software, Internet/Web-based", "Web Development"),
+
+    # --- AI / IT Consulting ---
+    ("91595", "Information Technology Consulting", "AI"),
+    ("91829", "Computer Software Consulting", "AI"),
+    ("91830", "Computer Network Consulting", "AI"),
+    ("92038", "Database Software", "AI"),
 ]
 
-NO_RESULTS_MARKER = "No results found"
 _perplexity_calls_this_run = 0
 
 
-def _build_listing_url(agency_number: int, page: int) -> str:
-    return (
-        f"{BASE_URL}?status=1"
-        f"&memberNumber={agency_number}"
-        f"&page={page}"
-        f"&agencyNumber={agency_number}"
-    )
+def _build_listing_url(nigp_code: str, page: int) -> str:
+    return f"{BASE_URL}?nigp={nigp_code}&page={page}"
 
 
-def _parse_listing(text: str) -> list[dict]:
+def _parse_listing(text: str) -> list:
     """Extract solicitation records from listing page via regex."""
     records = []
     blocks = re.split(r"\*\*Solicitation ID:\*\*", text)
@@ -73,7 +89,7 @@ def _parse_listing(text: str) -> list[dict]:
     return records
 
 
-def _parse_us_date(s: str) -> datetime | None:
+def _parse_us_date(s):
     if not s:
         return None
     try:
@@ -82,7 +98,7 @@ def _parse_us_date(s: str) -> datetime | None:
         return None
 
 
-def _is_within_window(due_date_raw: str | None) -> bool:
+def _is_within_window(due_date_raw):
     d = _parse_us_date(due_date_raw)
     if not d:
         return True
@@ -91,31 +107,69 @@ def _is_within_window(due_date_raw: str | None) -> bool:
     return today <= d <= cutoff
 
 
-def fetch(existing_ids: set[str] | None = None) -> list[dict]:
-    """V2 pipeline: listing → dedup → PDF/HTML extraction → Perplexity scoring."""
+def _is_active_status(status):
+    """Drop closed / cancelled / withdrawn solicitations."""
+    if not status:
+        return True
+    s = status.lower()
+    dead_markers = ("closed", "cancel", "withdraw", "awarded", "complete")
+    return not any(m in s for m in dead_markers)
+
+
+def _pick_primary_category(matches):
+    """When multiple NIGP codes match, pick a sensible default category."""
+    if not matches:
+        return "Other"
+    priority = ["Lobbying", "Government Relations", "Grants",
+                "Web Development", "AI", "Other"]
+    cats_found = {m["category"] for m in matches}
+    for cat in priority:
+        if cat in cats_found:
+            return cat
+    return "Other"
+
+
+def _format_nigp_context(matches):
+    """Format matched NIGP codes as a context block for Perplexity."""
+    if not matches:
+        return ""
+    lines = ["This RFP is tagged with the following NIGP commodity codes:"]
+    for m in matches:
+        lines.append(f"  - {m['code']}: {m['description']} (suggests {m['category']})")
+    lines.append(
+        "Trust these classifications when assigning category, but you may "
+        "override if the PDF content makes a different category clearly correct."
+    )
+    return "\n".join(lines)
+
+
+def fetch(existing_ids=None):
+    """V3 pipeline: iterate NIGP codes, not agencies."""
     global _perplexity_calls_this_run
     _perplexity_calls_this_run = 0
     existing_ids = existing_ids or set()
+    seen_this_run = set()
+    sol_id_to_matches = {}
     all_new_rfps = []
 
-    for agency_number, agency_name in AGENCIES:
+    for nigp_code, description, default_category in NIGP_CODES:
         if _perplexity_calls_this_run >= GLOBAL_PERPLEXITY_CAP:
             print(f"[{SOURCE_NAME}] Reached global cap. Stopping.")
             break
 
-        print(f"[{SOURCE_NAME}] Agency {agency_number} — {agency_name}")
+        print(f"[{SOURCE_NAME}] NIGP {nigp_code} — {description}")
 
-        for page in range(1, MAX_PAGES_PER_AGENCY + 1):
-            listing_url = _build_listing_url(agency_number, page)
+        for page in range(1, MAX_PAGES_PER_CODE + 1):
+            listing_url = _build_listing_url(nigp_code, page)
 
             try:
-                text = fetch_via_jina(listing_url, char_limit=12000, timeout=25)
+                text = fetch_via_jina(listing_url, char_limit=15000, timeout=25)
             except Exception as e:
                 print(f"  Page {page} listing fetch error: {e}")
                 break
 
             if NO_RESULTS_MARKER in text:
-                print(f"  Page {page}: no results, next agency")
+                print(f"  Page {page}: no results, next NIGP code")
                 break
 
             listings = _parse_listing(text)
@@ -124,23 +178,36 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
             if not listings:
                 break
 
-            # Stage 2: dedup + date filter (free)
             candidates = []
             skipped_dup = 0
             skipped_date = 0
+            skipped_status = 0
             for L in listings:
                 sid = L["solicitation_id"]
+
+                sol_id_to_matches.setdefault(sid, []).append({
+                    "code": nigp_code,
+                    "description": description,
+                    "category": default_category,
+                })
+
                 if sid in existing_ids:
+                    skipped_dup += 1
+                    continue
+                if sid in seen_this_run:
                     skipped_dup += 1
                     continue
                 if not _is_within_window(L["due_date_raw"]):
                     skipped_date += 1
                     continue
+                if not _is_active_status(L["status"]):
+                    skipped_status += 1
+                    continue
                 candidates.append(L)
 
-            print(f"    {len(candidates)} new (skipped {skipped_dup} dup, {skipped_date} out-of-window)")
+            print(f"    {len(candidates)} new (skipped {skipped_dup} dup, "
+                  f"{skipped_date} out-of-window, {skipped_status} closed)")
 
-            # Stage 3: for each NEW candidate — detail + PDF + score
             for L in candidates:
                 if _perplexity_calls_this_run >= GLOBAL_PERPLEXITY_CAP:
                     print(f"  Reached global cap mid-page. Stopping.")
@@ -148,7 +215,6 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
 
                 sid = L["solicitation_id"]
 
-                # Get full detail (HTML metadata + PDF text or HTML fallback)
                 try:
                     content = extract_content_for_scoring(sid)
                 except Exception as e:
@@ -163,27 +229,28 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
                     print(f"    {sid} skipped — no content to score")
                     continue
 
-                # Score with Perplexity
+                matched_codes = sol_id_to_matches.get(sid, [])
+                nigp_context = _format_nigp_context(matched_codes)
+                suggested_cat = _pick_primary_category(matched_codes)
+
                 try:
                     scored = analyze_single_rfp_detail(
                         scoring_text,
                         sid=sid,
-                        agency_name=agency_name,
-                        agency_number=agency_number,
+                        agency_name=detail.get("agency_member_number", "")
+                            or "Texas SmartBuy member",
+                        agency_number=0,
+                        nigp_context=nigp_context,
+                        suggested_category=suggested_cat,
                     )
                     _perplexity_calls_this_run += 1
                 except Exception as e:
                     print(f"    {sid} Perplexity error: {e}")
                     continue
 
-                # Merge HTML metadata into scored result.
-                # HTML wins for structured fields; Perplexity wins for analysis.
                 scored["solicitation_id"] = sid
                 scored["source"] = SOURCE_NAME
                 scored["url"] = detail.get("detail_url", f"{BASE_URL}/{sid}")
-                scored["agency_number"] = agency_number
-
-                # Prefer HTML-parsed values when present
                 if detail.get("title"):
                     scored["title"] = detail["title"]
                 if detail.get("contact_info"):
@@ -191,17 +258,24 @@ def fetch(existing_ids: set[str] | None = None) -> list[dict]:
                 if detail.get("deadline"):
                     scored["deadline"] = detail["deadline"]
                 if not scored.get("agency"):
-                    scored["agency"] = agency_name
+                    scored["agency"] = f"Texas SmartBuy member {detail.get('agency_member_number', '?')}"
 
-                # Add scoring provenance
-                scored["scoring_source"] = source_type  # "pdf" | "html" | "none"
+                scored["scoring_source"] = source_type
                 scored["pdf_url"] = content.get("pdf_used")
+                scored["nigp_matches"] = ", ".join(
+                    f"{m['code']} ({m['description']})" for m in matched_codes
+                )
 
-                existing_ids.add(sid)
+                seen_this_run.add(sid)
                 all_new_rfps.append(scored)
 
                 indicator = "📄" if source_type == "pdf" else "📝"
-                print(f"    {indicator} Scored {sid}: {scored.get('relevance_score', '?')}/10 — {scored.get('title', '')[:50]}")
+                codes_str = "/".join(m['code'] for m in matched_codes)
+                print(f"    {indicator} Scored {sid} [{codes_str}]: "
+                      f"{scored.get('relevance_score', '?')}/10 "
+                      f"({scored.get('category', '?')}) — "
+                      f"{scored.get('title', '')[:50]}")
 
-    print(f"[{SOURCE_NAME}] Done. {len(all_new_rfps)} new RFPs, {_perplexity_calls_this_run} Perplexity calls")
+    print(f"[{SOURCE_NAME}] Done. {len(all_new_rfps)} new RFPs, "
+          f"{_perplexity_calls_this_run} Perplexity calls")
     return all_new_rfps
