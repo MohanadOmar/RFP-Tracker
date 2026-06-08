@@ -94,6 +94,8 @@ def run(triggered_by: str = "manual") -> dict:
                     "relevance_score": score,
                     "relevance_reason": rfp.get("relevance_reason", ""),
                     "category": rfp.get("category", "Other"),
+                    "scoring_source": rfp.get("scoring_source", "html"),
+                    "pdf_url": rfp.get("pdf_url"),
                     "seen_date": today,
                 }
                 base44_client.create_rfp(payload)

@@ -48,6 +48,8 @@ def create_rfp(data: dict) -> dict:
         "relevance_score": data.get("relevance_score", 0),
         "relevance_reason": data.get("relevance_reason", ""),
         "category": data.get("category", "Other"),
+        "scoring_source": data.get("scoring_source", "html"),
+        "pdf_url": data.get("pdf_url"),
         "status": "New",
         "seen_date": data.get("seen_date"),
         "notified": False,
