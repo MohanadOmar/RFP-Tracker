@@ -61,7 +61,7 @@ _perplexity_calls_this_run = 0
 
 
 def _build_listing_url(nigp_code: str, page: int) -> str:
-    return f"{BASE_URL}?nigp={nigp_code}&page={page}"
+    return f"{BASE_URL}?status=1&page={page}&nigp={nigp_code}"
 
 
 def _parse_listing(text: str) -> list:
